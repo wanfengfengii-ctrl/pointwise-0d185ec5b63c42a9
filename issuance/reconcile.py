@@ -72,7 +72,10 @@ def reconcile_request(
     terminal = _read_terminal(reports, request)
     if terminal is not None:
         return terminal
-    if reports.find_confirmed(request.round_id, request.revision_id) is not None:
+    # A round has one official report.  If it was already committed for any
+    # revision, settle this request against it even when the analysis desk is
+    # offline: the original number gets its report, a superseded one is stale.
+    if reports.find_confirmed(request.round_id) is not None:
         return _settle(db, request.request_id)
     if source is None:
         return SignResult('pending')
@@ -84,6 +87,22 @@ def reconcile_request(
         terminal = _read_terminal(reports, live)
         if terminal is not None:
             return terminal
+        # The round settles exactly one official revision.  A request loses
+        # its eligibility when another revision already holds the round's
+        # confirmed report or first-issue decision, or when the round's
+        # current revision has moved past the one this request is bound to.
+        existing = reports.find_confirmed(live.round_id)
+        if existing is not None and existing.request_id != live.request_id:
+            RequestLedger(db).finish(live.request_id, None)
+            return SignResult('stale')
+        store = QualificationStore(source)
+        winner = store.find_winner(live.round_id)
+        if winner is not None and winner.request_id != live.request_id:
+            RequestLedger(db).finish(live.request_id, None)
+            return SignResult('stale')
+        if store.current(live.round_id) != live.revision_id:
+            RequestLedger(db).finish(live.request_id, None)
+            return SignResult('stale')
         approved = (reports.reserve_revision(live.request_id, live.candidate)
                     if live.candidate is not None else None)
     if approved != request.request_id:

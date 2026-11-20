@@ -19,6 +19,20 @@ def confirmation_unavailable(error: sqlite3.OperationalError) -> bool:
                     sqlite3.SQLITE_IOERR, sqlite3.SQLITE_CANTOPEN)
 
 
+def _ensure_unique_index(db: sqlite3.Connection, name: str, table: str, column: str) -> None:
+    """Add a round-scoped uniqueness index without rewriting history.
+
+    A database written by an older build may already hold one decision per
+    revision.  Then the index is skipped; reads still pick the earliest row,
+    which is the round's legal first issue.
+    """
+    try:
+        with db:
+            db.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table}({column})')
+    except sqlite3.IntegrityError:
+        pass
+
+
 class QualificationStore:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
@@ -32,16 +46,19 @@ class QualificationStore:
                     REFERENCES frozen_analyses(round_id, revision_id)
             )
         ''')
+        # One first issue per round, not one per revision: a round settles
+        # exactly one official revision even when several revisions exist.
         self.db.execute('''
             CREATE TABLE IF NOT EXISTS first_issue_notices (
-                round_id TEXT NOT NULL,
+                round_id TEXT PRIMARY KEY NOT NULL,
                 revision_id TEXT NOT NULL,
                 request_id TEXT NOT NULL UNIQUE,
-                PRIMARY KEY (round_id, revision_id),
                 FOREIGN KEY (round_id, revision_id)
                     REFERENCES frozen_analyses(round_id, revision_id)
             )
         ''')
+        _ensure_unique_index(self.db, 'one_first_issue_per_round',
+                             'first_issue_notices', 'round_id')
 
     def current(self, round_id: str) -> str | None:
         row = self.db.execute('SELECT revision_id FROM active_corrections WHERE round_id = ?',
@@ -67,9 +84,11 @@ class QualificationStore:
         with self.db:
             self.db.execute('''
                 INSERT INTO first_issue_notices (round_id, revision_id, request_id)
-                VALUES (?, ?, ?) ON CONFLICT(round_id, revision_id) DO NOTHING
+                VALUES (?, ?, ?) ON CONFLICT DO NOTHING
             ''', (decision.round_id, decision.revision_id, decision.request_id))
-            if self.find_winner(decision.round_id, decision.revision_id) != decision:
+            # The round has one first issue.  The stored row is the legal
+            # one; a later request may not displace it.
+            if self.find_winner(decision.round_id) != decision:
                 raise RuntimeError('issue notice conflicts with the stored request')
 
     def apply_correction(self, snapshot: FrozenAnalysis) -> str:
@@ -80,7 +99,9 @@ class QualificationStore:
             self.db.execute('BEGIN IMMEDIATE')
             if SnapshotStore(self.db).fetch(link.round_id, link.revision_id) != snapshot:
                 raise ValueError('correction does not match the frozen analysis')
-            if self.find_winner(link.round_id, link.revision_id) is not None:
+            # The first issue binds the whole round.  Any later correction for
+            # another revision stays view-only; it cannot become current.
+            if self.find_winner(link.round_id) is not None:
                 return 'view_only'
             self.db.execute('''
                 INSERT INTO active_corrections (round_id, revision_id) VALUES (?, ?)

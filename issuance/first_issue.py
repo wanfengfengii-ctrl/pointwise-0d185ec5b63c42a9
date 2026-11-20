@@ -35,7 +35,7 @@ def sign(
     try:
         request = ledger.bind(request_id, round_id, revision_id)
         if request.status == 'pending' and source is not None:
-            if request.candidate is None and ReportStore(db).find_confirmed(round_id, revision_id) is None:
+            if request.candidate is None and ReportStore(db).find_confirmed(round_id) is None:
                 snapshot = inspect_revision(source, round_id, revision_id)
                 if QualificationStore(source).current(round_id) == revision_id:
                     request = ledger.save_candidate(request, pack_report_payload(snapshot))
